@@ -120,7 +120,8 @@ def impedance_sweep(func_gen, eload, dmm, z_start, z_stop, num_points, complianc
             logging.info(f"Freq: {freq} Hz, Volt: {voltage:.3f} V, Z: {impedance:.2f} Ohm")
     except Exception as e:
         logging.error(f"Error during impedance measurement: {e}")
-        return None
+        # Return whatever has been collected so far
+        return impedances
     
     finally:
         try:
@@ -166,7 +167,8 @@ def smu_volt_sweep(smu, v_start, v_stop, num_points, current_compliance):
         return smu_volt_array, smu_curr_array
     except Exception as e:
         print(f"[ERROR] Voltage sweep failed: {e}")
-        return None, None
+        # Return partial arrays if available, else empty lists
+        return smu_volt_array if 'smu_volt_array' in locals() else [], smu_curr_array if 'smu_curr_array' in locals() else []
 
 def R0_write(relay, addresses, values, retries=5, delay=0.1):
 
@@ -236,12 +238,31 @@ def save_data(save_dir, name, data1, data2, data_type):
         f.attrs["timestamp"] = timestamp
     logging.info(f"Saved data to {filename}")
 ######################################################################################################################
+
+def safe_shutdown(devices):
+    logging.info("Initiating safe shutdown...")
+    for dev in devices:
+        try:
+            if hasattr(dev, 'close'):
+                dev.close()
+                logging.info(f"{dev} closed successfully.")
+        except Exception as e:
+            logging.warning(f"Error closing device {dev}: {e}")
+
 def main_loop(smu_devices, tek, smu, dmm, func_gen, eload, R0):
     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
     save_dir = f"results_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
+    run_summary = {
+        "total_devices": len(smu_devices),
+        "success": 0,
+        "failures": [],
+        "partial_data": [],
+        "start_time": time.time()
+    }
 
     for device in smu_devices:
+        logging.info(f"Beginning test sequence for {device.get('name', 'unknown_device')}")
         try:
             name = device.get("name", "unknown_device")
             input_config = device.get("Input", {})
@@ -256,11 +277,24 @@ def main_loop(smu_devices, tek, smu, dmm, func_gen, eload, R0):
                 input_compliance = input_config.get("compliance", 1e-3)
 
                 if input_mode == "volt_sweep":
-                    v_start = input_config.get("v_start", -0.5)
-                    v_stop = input_config.get("v_stop", 1.0)
-                    num_points = input_config.get("num_points", 100)
-                    voltages, currents = smu_volt_sweep(smu, v_start, v_stop, num_points, input_compliance)
-                    save_data(save_dir, name, voltages, currents, "iv_data")
+                    try:
+                        v_start = input_config.get("v_start", -0.5)
+                        v_stop = input_config.get("v_stop", 1.0)
+                        num_points = input_config.get("num_points", 100)
+                        voltages, currents = smu_volt_sweep(smu, v_start, v_stop, num_points, input_compliance)
+                        device_dir = os.path.join(save_dir, name)
+                        os.makedirs(device_dir, exist_ok=True)
+                        save_data(device_dir, name, voltages, currents, "iv_data")
+                        run_summary["success"] += 1
+                    except Exception as e:
+                        logging.error(f"Voltage sweep failed for {name}: {e}")
+                        run_summary["failures"].append(name)
+                        # Save partial data if available
+                        if voltages and currents:
+                            device_dir = os.path.join(save_dir, name)
+                            os.makedirs(device_dir, exist_ok=True)
+                            save_data(device_dir, name, voltages, currents, "iv_data_partial")
+                            run_summary["partial_data"].append(name)
 
             # process output config
             if output_config:
@@ -269,23 +303,49 @@ def main_loop(smu_devices, tek, smu, dmm, func_gen, eload, R0):
                 output_compliance = input_config.get("compliance", 1e-3)
 
                 if output_mode == "impedance_sweep":
-                    z_start = output_config.get("z_start", 0)
-                    z_stop = output_config.get("z_stop", 5)
-                    num_points = output_config.get("num_points", 100)
-                    impedances = impedance_sweep(func_gen, eload, dmm, z_start, z_stop, num_points, output_compliance)
-                    save_data(save_dir, name, impedances, None, "impedance_data")
+                    try:
+                        z_start = output_config.get("z_start", 0)
+                        z_stop = output_config.get("z_stop", 5)
+                        num_points = output_config.get("num_points", 100)
+                        impedances = impedance_sweep(func_gen, eload, dmm, z_start, z_stop, num_points, output_compliance)
+                        device_dir = os.path.join(save_dir, name)
+                        os.makedirs(device_dir, exist_ok=True)
+                        save_data(device_dir, name, impedances, None, "impedance_data")
+                        run_summary["success"] += 1
+                    except Exception as e:
+                        logging.error(f"Impedance sweep failed for {name}: {e}")
+                        run_summary["failures"].append(name)
+                        # Save partial data if available
+                        if impedances:
+                            device_dir = os.path.join(save_dir, name)
+                            os.makedirs(device_dir, exist_ok=True)
+                            save_data(device_dir, name, impedances, None, "impedance_data_partial")
+                            run_summary["partial_data"].append(name)
 
         except Exception as e:
             logging.error(f"Error testing device {device.get('name', 'unknown')}: {e}")
+            run_summary["failures"].append(device.get('name', 'unknown'))
+
+    run_summary["end_time"] = time.time()
+    run_time = run_summary["end_time"] - run_summary["start_time"]
+    logging.info("\n===== Test Summary =====")
+    logging.info(f"Total devices tested: {run_summary['total_devices']}")
+    logging.info(f"Successful runs: {run_summary['success']}")
+    logging.info(f"Failures: {run_summary['failures']}")
+    logging.info(f"Partial data saved: {run_summary['partial_data']}")
+    logging.info(f"Total run time: {run_time:.2f} seconds")
+    logging.info("========================")
 
 if __name__ == "__main__":
     # Initialize R0
     R0 = msc(port="COM3", baudrate=9600, timeout=5, retries=10)
     R0.connect()
+    logging.info("R0 initialized and connected.")
     print(R0_write(R0, list(range(32)), [False for _ in range(32)]))
 
     # Initialize resource manager
     rm = pyvisa.ResourceManager()
+    logging.info("Resource manager initialized.")
 
     # Initialize scope
     try:
@@ -294,7 +354,7 @@ if __name__ == "__main__":
         tek_scope.timeout = 10000
         tek_scope.write('*rst')
         tek_scope.write('*cls')
-        logging.info(f"Scope initialized: {tek_scope.query("*IDN?").strip()}")
+        logging.info(f"Scope initialized: {tek_scope.query('*IDN?').strip()}")
     except pyvisa.errors.VisaIOError as e:
         logging.error(f"Error initializing scope: {e}")
 
@@ -312,7 +372,7 @@ if __name__ == "__main__":
         func_gen.timeout = 5000
         func_gen.write('*rst')
         func_gen.write('*cls')
-        logging.info(f"Function generator initialized: {func_gen.query("*IDN?").strip()}")
+        logging.info(f"Function generator initialized: {func_gen.query('*IDN?').strip()}")
     except pyvisa.errors.VisaIOError as e:
         logging.error(f"Error initializing function generator: {e}")
 
@@ -323,7 +383,7 @@ if __name__ == "__main__":
         smu.timeout = 10000
         smu.write('*rst')
         smu.write('*cls')
-        logging.info(f"SMU initialized: {smu.query("*IDN?").strip()}")
+        logging.info(f"SMU initialized: {smu.query('*IDN?').strip()}")
     except pyvisa.errors.VisaIOError as e:
         logging.error(f"Error initializing SMU: {e}")
 
@@ -334,7 +394,7 @@ if __name__ == "__main__":
         dmm.timeout = 5000
         dmm.write('*rst')
         dmm.write('*cls')
-        logging.info(f"Power supply initialized: {dmm.query("*IDN?").strip()}")
+        logging.info(f"Power supply initialized: {dmm.query('*IDN?').strip()}")
     except pyvisa.errors.VisaIOError as e:
         logging.error(f"Error initializing power supply: {e}")
 
@@ -345,7 +405,7 @@ if __name__ == "__main__":
         eload.timeout = 5000
         eload.write('*rst')
         eload.write('*cls')
-        logging.info(f"Electronic load initialized: {eload.query("*IDN?").strip()}")
+        logging.info(f"Electronic load initialized: {eload.query('*IDN?').strip()}")
     except pyvisa.errors.VisaIOError as e:
         logging.error(f"Error initializing electronic load")
 
@@ -373,15 +433,11 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
 
+    devices = [tek_scope, func_gen, smu, dmm, eload, R0]
 
     try:
         main_loop(smu_devices, tek_scope, smu, dmm, func_gen, eload, R0)
     except Exception as e:
         print(f"Unhandled error in main loop: {e}")
     finally:
-        tek_scope.close()
-        func_gen.close()
-        smu.close()
-        dmm.close()
-        R0.close()
-        eload.close()
+        safe_shutdown(devices)
