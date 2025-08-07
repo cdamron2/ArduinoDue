@@ -12,7 +12,7 @@ from datetime import datetime
 from datetime import timedelta
 import h5py
 import yaml
-from pymodbus.client.sync import ModbusSerialClient as msc
+from pymodbus.client import ModbusSerialClient as msc
 
 import logging
 from pymodbus.exceptions import ModbusIOException
@@ -52,8 +52,6 @@ def scope_trig_wait(tek):
 def set_scope_measurements(Tekscope):
     Tekscope.write('measurement:deleteall')
 
-    # Level Translator measurements (make sure channels match)
-    # SCOPE_CH1 is BOX, SCOPE_CH2 is FG_CH1
     Tekscope.write('''
                     :measurement:meas1:type base;
                     :measurement:meas2:type top;
@@ -142,32 +140,32 @@ def smu_volt_sweep(smu, v_start, v_stop, num_points, current_compliance):
           :sour:volt:stop {v_stop};
           :sour:volt:step {step_size};
           ''')
-        # Query number of points set
+        # query number of points set
         x = smu.query(':sour:volt:poin?')
-        # Set up compliance and measurement
+        # set up compliance and measurement
         smu.write(f'''
             :sens:func "curr";
             :sens:curr:prot {current_compliance};
             :sens:func "curr";
             :sens:func "volt";
             ''')
-        # Configure trigger
+        # configure trigger
         smu.write(f'''
             :trig:sour aint;
             :trig:count {x};
             ''')
-        # Begin sweep
+        # begin sweep
         smu.write('init (@1)')
         # Read measured arrays
         smu_volt_array = smu.query(':fetc:arr:volt? (@1)')
         smu_curr_array = smu.query(':fetc:arr:curr? (@1)')
 
-        # Cleanup
+        # cleanup
         smu.write('sour:volt:mode fix; :sour:volt 0')
         return smu_volt_array, smu_curr_array
     except Exception as e:
-        print(f"[ERROR] Voltage sweep failed: {e}")
-        # Return partial arrays if available, else empty lists
+        print(f"[ERROR] Voltage sweep failed: {e}")  
+        # return partial arrays if available, else empty lists
         return smu_volt_array if 'smu_volt_array' in locals() else [], smu_curr_array if 'smu_curr_array' in locals() else []
 
 def R0_write(relay, addresses, values, retries=5, delay=0.1):
@@ -180,7 +178,7 @@ def R0_write(relay, addresses, values, retries=5, delay=0.1):
     try:
         # read existing state
         for attempt in range(retries):
-            read = relay.read_coils(0, 32, unit=247)
+            read = relay.read_coils(0, 32, 247)
             if not read.isError():
                 break
             logging.warning(f"Read attempt {attempt+1} failed, retrying...")
@@ -208,7 +206,7 @@ def R0_write(relay, addresses, values, retries=5, delay=0.1):
 
         # confirm write
         for attempt in range(retries):
-            verify = relay.read_coils(0, 32, unit=247)
+            verify = relay.read_coils(0, 32, 247)
             if not verify.isError() and list(verify.bits[:32]) == codeword:
                 break
             logging.warning(f"Verify attempt {attempt+1} failed, retrying...")
