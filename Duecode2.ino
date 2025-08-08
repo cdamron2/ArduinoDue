@@ -1,135 +1,108 @@
-#include <SPI.h>
-#include <SD.h>
-#include <PlayingWithFusion_MAX31856.h>
+#include <Wire.h>
+#include <PWFusion_Mcp960x.h>
 
-// number of thermocouples and their chip select pins
-const int numSensors = 4;
-int csPins[numSensors] = {4, 5, 6, 7};
+// Constants
+const int NUM_THERMOCOUPLES = 4;
+const int DELAY_TIME = 5000; // 5 seconds
 
-// default thermocouple type (changeable at runtime)
-max31856_thermocoupletype_t tcType = MAX31856_TCTYPE_K;
+// Create an array of sensor objects
+Mcp960x thermocouples[NUM_THERMOCOUPLES];
 
-// reading interval in milliseconds
-unsigned long sampleInterval = 1000;
+// Thermocouple selection
+Mcp960x_Thermocouple_e selectedType;
+bool typeSelected = false;
 
-// SD card chip select pin
-const int sdCS = 10;
+// Variables for non-blocking delay
+unsigned long previousMillis = 0;
 
-PlayingWithFusion_MAX31856 sensors[numSensors];
-unsigned long lastSample = 0;
-File logFile;
+void initializeThermocouples() {
+  uint8_t addresses[] = {0x60, 0x61, 0x64, 0x67};
+  for (int i = 0; i < NUM_THERMOCOUPLES; i++) {
+    thermocouples[i].begin(addresses[i]);
+    if (thermocouples[i].isConnected()) {
+      Serial.print(F("Found MCP9601 sensor at address 0x"));
+      Serial.println(addresses[i], HEX);
+
+      // Apply selected thermocouple type
+      thermocouples[i].setThermocoupleType(selectedType);
+      thermocouples[i].setResolution(RES_18BIT, RES_0p0625);
+    } else {
+      Serial.print(F("ERROR: Unable to connect to MCP9601 sensor at address 0x"));
+      Serial.println(addresses[i], HEX);
+    }
+  }
+}
+
+void readAndPrintTemperatures() {
+  for (int i = 0; i < NUM_THERMOCOUPLES; i++) {
+    Serial.print(F("Thermocouple "));
+    Serial.print(i + 1);
+    Serial.print(F(" Temp: "));
+    switch (thermocouples[i].getStatus()) {
+      case OPEN_CIRCUIT:
+        Serial.println(F("Open Circuit"));
+        break;
+      case SHORT_CIRCUIT:
+        Serial.println(F("Short Circuit"));
+        break;
+      case READY:
+        Serial.print(thermocouples[i].getThermocoupleTemp());
+        Serial.println(F(" °C"));
+        break;
+      default:
+        Serial.println(F("Pending"));
+        break;
+    }
+
+    Serial.print(F("Ambient Temp: "));
+    Serial.print(thermocouples[i].getColdJunctionTemp());
+    Serial.println(F(" °C"));
+    Serial.println();
+  }
+}
 
 void setup() {
-  Serial.begin(115200);
-  delay(500);
-  Serial.println("\nMulti-Thermocouple Reader");
-  Serial.println("Commands: TYPE <K/J/T/E/N/S/R/B>, RATE <ms>\n");
+  Wire.begin();
+  Wire.setClock(100000);
+  Serial.begin(9600);
+  // Wait for serial connection
+  while (!Serial);
 
-  SPI.begin();
+  Serial.println(F("=== MCP9601 Thermocouple Reader ==="));
+  Serial.println(F("Select thermocouple type:"));
+  Serial.println(F("1. Type K"));
+  Serial.println(F("2. Type J"));
+  Serial.println(F("3. Type T"));
+  Serial.println(F("4. Type N"));
 
-  // initialize thermocouples
-  for (int i = 0; i < numSensors; i++) {
-    sensors[i].begin(csPins[i]);
-    sensors[i].setThermocoupleType(tcType);
-    sensors[i].setConversionMode(MAX31856_CONTINUOUS);
-  }
-
-  // initialize SD card for logging
-  if (!SD.begin(sdCS)) {
-    Serial.println("SD init failed. Logging disabled.");
-  } else {
-    Serial.println("SD card ready.");
-    logFile = SD.open("temps.csv", FILE_WRITE);
-    if (logFile) {
-      logFile.println("Time(ms),TC1(C),TC2(C),TC3(C),TC4(C)");
-      logFile.flush();
-    }
-  }
-}
-
-void loop() {
-  checkSerialCommands();
-
-  if (millis() - lastSample >= sampleInterval) {
-    lastSample = millis();
-    readAllThermocouples();
-  }
-}
-
-// read all thermocouples and log results
-void readAllThermocouples() {
-  Serial.printf("[%lu ms] ", millis());
-  String logLine = String(millis());
-
-  for (int i = 0; i < numSensors; i++) {
-    float tempC = readThermocouple(i);
-    if (!isnan(tempC)) {
-      Serial.printf("TC%d: %.2f C  ", i + 1, tempC);
-      logLine += "," + String(tempC, 2);
-    } else {
-      Serial.printf("TC%d: ERROR  ", i + 1);
-      logLine += ",ERR";
-    }
-  }
-  Serial.println();
-
-  if (logFile) {
-    logFile.println(logLine);
-    logFile.flush();
-  }
-}
-
-// read a single thermocouple with basic fault retry
-float readThermocouple(int index) {
-  uint8_t fault = sensors[index].readFault();
-  if (fault) {
-    delay(50);
-    fault = sensors[index].readFault();
-    if (fault) return NAN;
-  }
-  return sensors[index].readThermocoupleTemp();
-}
-
-// handle runtime serial commands
-void checkSerialCommands() {
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    cmd.toUpperCase();
-
-    if (cmd.startsWith("TYPE ")) {
-      char typeChar = cmd.charAt(5);
-      setThermocoupleType(typeChar);
-    }
-    else if (cmd.startsWith("RATE ")) {
-      long newRate = cmd.substring(5).toInt();
-      if (newRate > 100) {
-        sampleInterval = newRate;
-        Serial.printf("Sample rate set to %ld ms\n", sampleInterval);
+  // Wait for user to select thermocouple type
+  while (!typeSelected) {
+    if (Serial.available()) {
+      // Small delay to ensure buffer is ready
+      delay(10);
+      char input = Serial.read();
+      // Ignore newline characters
+      if (input == '\n' || input == '\r') continue;
+      switch (input) {
+        case '1': selectedType = TYPE_K; Serial.println(F("Selected: Type K")); typeSelected = true; break;
+        case '2': selectedType = TYPE_J; Serial.println(F("Selected: Type J")); typeSelected = true; break;
+        case '3': selectedType = TYPE_T; Serial.println(F("Selected: Type T")); typeSelected = true; break;
+        case '4': selectedType = TYPE_N; Serial.println(F("Selected: Type N")); typeSelected = true; break;
+        default: Serial.println(F("Invalid selection. Enter 1 to 4.")); break;
       }
     }
   }
+
+  // Initialize thermocouples
+  initializeThermocouples();
 }
 
-// update thermocouple type for all sensors
-void setThermocoupleType(char t) {
-  max31856_thermocoupletype_t newType;
-  switch (t) {
-    case 'K': newType = MAX31856_TCTYPE_K; break;
-    case 'J': newType = MAX31856_TCTYPE_J; break;
-    case 'T': newType = MAX31856_TCTYPE_T; break;
-    case 'E': newType = MAX31856_TCTYPE_E; break;
-    case 'N': newType = MAX31856_TCTYPE_N; break;
-    case 'S': newType = MAX31856_TCTYPE_S; break;
-    case 'R': newType = MAX31856_TCTYPE_R; break;
-    case 'B': newType = MAX31856_TCTYPE_B; break;
-    default:
-      Serial.println("Invalid type.");
-      return;
+void loop() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= DELAY_TIME) {
+    previousMillis = currentMillis;
+
+    // Read and print temperatures
+    readAndPrintTemperatures();
   }
-  tcType = newType;
-  for (int i = 0; i < numSensors; i++) {
-    sensors[i].setThermocoupleType(tcType);
-  }
-  Serial.printf("Type set to %c\n", t);
 }
